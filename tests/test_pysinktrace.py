@@ -39,6 +39,31 @@ def route():
 ''')
         self.assertEqual(findings[0].rule_id, "PST003")
 
+    def test_tracks_source_wrapper(self):
+        findings = self.scan_code('''
+def user_value():
+    return request.args.get("value")
+
+def route():
+    value = user_value()
+    eval(value)
+''')
+        self.assertEqual(findings[0].rule_id, "PST002")
+        self.assertTrue(findings[0].source.startswith("wrapper:user_value"))
+
+    def test_tracks_sink_wrapper(self):
+        findings = self.scan_code('''
+def execute(command):
+    os.system(command)
+
+def route():
+    value = request.form.get("value")
+    execute(value)
+''')
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].sink, "os.system")
+        self.assertIn(6, findings[0].path)
+
 
 if __name__ == "__main__":
     unittest.main()
