@@ -58,10 +58,12 @@ def dotted(node: ast.AST) -> str:
 
 
 class FunctionTracer(ast.NodeVisitor):
-    def __init__(self, filename: str, function: str):
+    def __init__(self, filename: str, function: str, source_wrappers=None, sink_summaries=None):
         self.filename, self.function = filename, function
         self.state: dict[str, tuple[Trace, ...]] = {}
         self.findings: list[Finding] = []
+        self.source_wrappers = source_wrappers or {}
+        self.sink_summaries = sink_summaries or {}
 
     def traces(self, node: ast.AST) -> tuple[Trace, ...]:
         if isinstance(node, ast.Name):
@@ -70,6 +72,8 @@ class FunctionTracer(ast.NodeVisitor):
             name = dotted(node.func)
             if name in SOURCE_SUFFIXES:
                 return (Trace(name, node.lineno, (node.lineno,)),)
+            if name in self.source_wrappers:
+                return (Trace(self.source_wrappers[name], node.lineno, (node.lineno,)),)
             carried = tuple(trace for arg in [*node.args, *(kw.value for kw in node.keywords)] for trace in self.traces(arg))
             if name in SANITIZER_SUFFIXES:
                 return ()
@@ -101,6 +105,20 @@ class FunctionTracer(ast.NodeVisitor):
     def visit_Call(self, node: ast.Call) -> None:
         sink = dotted(node.func)
         config = SINKS.get(sink)
+        if not config and sink in self.sink_summaries:
+            for summary in self.sink_summaries[sink]:
+                index = summary["parameter_index"]
+                if index >= len(node.args):
+                    continue
+                for trace in self.traces(node.args[index]):
+                    self.findings.append(Finding(
+                        summary["rule_id"], summary["severity"],
+                        f"Untrusted data crosses {sink} and reaches {summary['sink']}",
+                        self.filename, self.function, trace.source, trace.source_line,
+                        summary["sink"], summary["sink_line"], (*trace.path, node.lineno, summary["sink_line"]),
+                    ))
+            self.generic_visit(node)
+            return
         if not config:
             self.generic_visit(node)
             return
@@ -120,12 +138,54 @@ class FunctionTracer(ast.NodeVisitor):
 
 
 class ModuleTracer(ast.NodeVisitor):
-    def __init__(self, filename: str):
+    def __init__(self, filename: str, tree: ast.Module):
         self.filename = filename
         self.findings: list[Finding] = []
+        self.functions = {node.name: node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        self.source_wrappers = self._source_wrappers()
+        self.sink_summaries = self._sink_summaries()
+
+    def _source_wrappers(self) -> dict[str, str]:
+        wrappers = {}
+        changed = True
+        while changed:
+            changed = False
+            for name, function in self.functions.items():
+                if name in wrappers:
+                    continue
+                for node in ast.walk(function):
+                    if isinstance(node, ast.Return) and isinstance(node.value, ast.Call):
+                        called = dotted(node.value.func)
+                        if called in SOURCE_SUFFIXES or called in wrappers:
+                            wrappers[name] = f"wrapper:{name}({called})"
+                            changed = True
+                            break
+        return wrappers
+
+    def _sink_summaries(self) -> dict[str, list[dict]]:
+        summaries = {}
+        for name, function in self.functions.items():
+            tracer = FunctionTracer(self.filename, name, self.source_wrappers, {})
+            for index, argument in enumerate(function.args.args):
+                tracer.state[argument.arg] = (Trace(f"parameter:{argument.arg}", function.lineno, (function.lineno,)),)
+            for statement in function.body:
+                tracer.visit(statement)
+            values = []
+            for finding in tracer.findings:
+                if not finding.source.startswith("parameter:"):
+                    continue
+                parameter = finding.source.split(":", 1)[1]
+                index = next((i for i, arg in enumerate(function.args.args) if arg.arg == parameter), -1)
+                if index >= 0:
+                    values.append({"parameter_index": index, "rule_id": finding.rule_id,
+                                   "severity": finding.severity, "sink": finding.sink,
+                                   "sink_line": finding.sink_line})
+            if values:
+                summaries[name] = values
+        return summaries
 
     def _trace_body(self, body: list[ast.stmt], function: str) -> None:
-        tracer = FunctionTracer(self.filename, function)
+        tracer = FunctionTracer(self.filename, function, self.source_wrappers, self.sink_summaries)
         for statement in body:
             tracer.visit(statement)
         self.findings.extend(tracer.findings)
@@ -143,7 +203,7 @@ class ModuleTracer(ast.NodeVisitor):
 
 def scan(path: Path) -> list[Finding]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    tracer = ModuleTracer(str(path))
+    tracer = ModuleTracer(str(path), tree)
     tracer.trace_module(tree)
     unique = {(f.rule_id, f.source_line, f.sink_line, f.function): f for f in tracer.findings}
     return sorted(unique.values(), key=lambda f: (f.file, f.sink_line, f.rule_id))
